@@ -5,7 +5,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node src/webhook-server.js",
     "sync": "node src/sync.js",
     "sync-location": "node src/sync-location-only.js",
     "sync-subscriptions": "node src/sync-subscriptions.js",
