@@ -1,20 +1,21 @@
 import dotenv from 'dotenv';
 import express from 'express';
+import Stripe from 'stripe';
 import { HubSpotClient } from './clients/hubspotClient.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || process.env.WEBHOOK_PORT || 3000;
-const WEBHOOK_SECRET = process.env.MIGHTY_WEBHOOK_SECRET; // optional signature verification
-
-app.use(express.json());
+const WEBHOOK_SECRET = process.env.MIGHTY_WEBHOOK_SECRET;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function log(event, email, message) {
+function log(source, event, email, message) {
   const ts = new Date().toISOString();
-  console.log(`[${ts}] [${event}] ${email || '?'} — ${message}`);
+  console.log(`[${ts}] [${source}] [${event}] ${email || '?'} — ${message}`);
 }
 
 function deriveSubscriptionStatus(member) {
@@ -79,10 +80,170 @@ function buildContactProperties(member, status) {
   return properties;
 }
 
-// ── Webhook endpoint ───────────────────────────────────────────────────────
+// ── Stripe webhook ─────────────────────────────────────────────────────────
+// IMPORTANT: Must be registered BEFORE app.use(express.json()) to preserve raw body
+
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+
+  if (STRIPE_WEBHOOK_SECRET) {
+    const sig = req.headers['stripe-signature'];
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.warn(`[Stripe] Signature verification failed: ${err.message}`);
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+  } else {
+    event = JSON.parse(req.body);
+  }
+
+  const hubspot = new HubSpotClient(process.env.HUBSPOT_ACCESS_TOKEN);
+
+  try {
+    switch (event.type) {
+
+      // ── Subscription upgraded (free → premium) ───────────────────────
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object;
+        const customer = await stripe.customers.retrieve(subscription.customer);
+        const email = customer.email?.toLowerCase();
+        if (!email) break;
+
+        const contact = await hubspot.findContactByEmail(email);
+        if (!contact) break;
+
+        const stripeStatus = subscription.status; // active, past_due, canceled, etc.
+        let mightyStatus, mightyPlanType;
+
+        if (stripeStatus === 'active') {
+          mightyStatus = 'active';
+          mightyPlanType = 'premium';
+        } else if (stripeStatus === 'past_due' || stripeStatus === 'unpaid') {
+          mightyStatus = 'past_due';
+          mightyPlanType = 'premium'; // still premium, just payment overdue
+        } else {
+          mightyStatus = 'canceled';
+          mightyPlanType = 'canceled';
+        }
+
+        const properties = {
+          stripe_subscription_status: stripeStatus,
+          mighty_subscription_status: mightyStatus,
+          mighty_plan_type: mightyPlanType,
+        };
+
+        // If cancellation is scheduled (cancel_at_period_end) but not yet active
+        if (subscription.cancel_at_period_end && subscription.cancel_at) {
+          properties.mighty_canceled_at = new Date(subscription.cancel_at * 1000).toISOString().split('T')[0];
+        }
+
+        await hubspot.client.crm.contacts.basicApi.update(contact.id, { properties });
+        log('Stripe', event.type, email, `stripe status: ${stripeStatus} → mighty: ${mightyStatus}`);
+        break;
+      }
+
+      // ── Subscription canceled/deleted (premium → free or deleted) ────
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object;
+        const customer = await stripe.customers.retrieve(subscription.customer);
+        const email = customer.email?.toLowerCase();
+        if (!email) break;
+
+        const contact = await hubspot.findContactByEmail(email);
+        if (!contact) break;
+
+        const canceledDate = subscription.canceled_at
+          ? new Date(subscription.canceled_at * 1000).toISOString().split('T')[0]
+          : new Date().toISOString().split('T')[0];
+
+        const daysSince = Math.floor(
+          (Date.now() - (subscription.canceled_at * 1000 || Date.now())) / (1000 * 60 * 60 * 24)
+        );
+
+        await hubspot.client.crm.contacts.basicApi.update(contact.id, {
+          properties: {
+            stripe_subscription_status: 'canceled',
+            mighty_subscription_status: 'canceled',
+            mighty_plan_type: 'canceled',
+            mighty_canceled_at: canceledDate,
+            mighty_subscription_canceled_at: canceledDate,
+            mighty_downgraded_to_free_at: canceledDate,
+            mighty_days_since_cancellation: daysSince,
+          }
+        });
+        log('Stripe', event.type, email, `marked as canceled (${canceledDate})`);
+        break;
+      }
+
+      // ── Payment succeeded → update last payment date ─────────────────
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object;
+        if (invoice.amount_paid === 0) break; // skip $0 invoices
+
+        const customer = await stripe.customers.retrieve(invoice.customer);
+        const email = customer.email?.toLowerCase();
+        if (!email) break;
+
+        const contact = await hubspot.findContactByEmail(email);
+        if (!contact) break;
+
+        const paymentDate = new Date(invoice.created * 1000).toISOString().split('T')[0];
+        const paymentAmount = `$${(invoice.amount_paid / 100).toFixed(2)}`;
+
+        await hubspot.client.crm.contacts.basicApi.update(contact.id, {
+          properties: {
+            stripe_last_payment_date: paymentDate,
+            stripe_last_payment_amount: paymentAmount,
+            stripe_subscription_status: 'active',
+            mighty_subscription_status: 'active',
+            mighty_plan_type: 'premium',
+          }
+        });
+        log('Stripe', event.type, email, `payment ${paymentAmount} on ${paymentDate}`);
+        break;
+      }
+
+      // ── Payment failed → flag as past due ────────────────────────────
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        const customer = await stripe.customers.retrieve(invoice.customer);
+        const email = customer.email?.toLowerCase();
+        if (!email) break;
+
+        const contact = await hubspot.findContactByEmail(email);
+        if (!contact) break;
+
+        await hubspot.client.crm.contacts.basicApi.update(contact.id, {
+          properties: {
+            stripe_subscription_status: 'past_due',
+            mighty_subscription_status: 'past_due',
+          }
+        });
+        log('Stripe', event.type, email, 'payment failed — marked as past_due');
+        break;
+      }
+
+      default:
+        // Ignore other Stripe events
+    }
+
+    res.json({ ok: true, type: event.type });
+
+  } catch (error) {
+    console.error(`[Stripe ERROR] ${event.type} — ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Global JSON parsing (after Stripe route) ───────────────────────────────
+
+app.use(express.json());
+
+// ── Mighty Networks webhook ────────────────────────────────────────────────
 
 app.post('/webhooks/mighty', async (req, res) => {
-  // Optional: verify webhook secret header if Mighty sends one
   if (WEBHOOK_SECRET) {
     const signature = req.headers['x-mighty-signature'] || req.headers['x-webhook-secret'];
     if (signature !== WEBHOOK_SECRET) {
@@ -99,11 +260,11 @@ app.post('/webhooks/mighty', async (req, res) => {
 
   const email = data.email?.toLowerCase();
   if (!email) {
-    log(event, null, 'No email in payload — skipping');
+    log('Mighty', event, null, 'No email in payload — skipping');
     return res.status(200).json({ ok: true, skipped: true });
   }
 
-  log(event, email, 'Received');
+  log('Mighty', event, email, 'Received');
 
   const hubspot = new HubSpotClient(process.env.HUBSPOT_ACCESS_TOKEN);
 
@@ -117,7 +278,7 @@ app.post('/webhooks/mighty', async (req, res) => {
 
         if (existing) {
           await hubspot.client.crm.contacts.basicApi.update(existing.id, { properties });
-          log(event, email, `Updated existing HubSpot contact (ID: ${existing.id})`);
+          log('Mighty', event, email, `Updated existing HubSpot contact (ID: ${existing.id})`);
         } else {
           await hubspot.client.crm.contacts.basicApi.create({
             properties: {
@@ -127,7 +288,7 @@ app.post('/webhooks/mighty', async (req, res) => {
               lastname: data.last_name || ''
             }
           });
-          log(event, email, 'Created new HubSpot contact');
+          log('Mighty', event, email, 'Created new HubSpot contact');
         }
         break;
       }
@@ -139,9 +300,9 @@ app.post('/webhooks/mighty', async (req, res) => {
 
         if (contact) {
           await hubspot.client.crm.contacts.basicApi.update(contact.id, { properties });
-          log(event, email, `Updated HubSpot contact — status: ${properties.mighty_subscription_status}`);
+          log('Mighty', event, email, `Updated — status: ${properties.mighty_subscription_status}`);
         } else {
-          log(event, email, 'Contact not found in HubSpot — skipping update');
+          log('Mighty', event, email, 'Contact not found in HubSpot — skipping update');
         }
         break;
       }
@@ -155,18 +316,18 @@ app.post('/webhooks/mighty', async (req, res) => {
             properties: {
               mighty_subscription_status: 'deleted',
               mighty_plan_type: 'canceled',
-              member_deleted_status: 'deleted_recent' // will be recategorized on next tag-winback run
+              member_deleted_status: 'deleted_recent'
             }
           });
-          log(event, email, `Marked as DELETED in HubSpot (ID: ${contact.id})`);
+          log('Mighty', event, email, `Marked as DELETED in HubSpot (ID: ${contact.id})`);
         } else {
-          log(event, email, 'Contact not found in HubSpot — nothing to mark deleted');
+          log('Mighty', event, email, 'Contact not found in HubSpot — nothing to mark deleted');
         }
         break;
       }
 
       default:
-        log(event, email, `Unhandled event type — ignored`);
+        log('Mighty', event, email, 'Unhandled event type — ignored');
     }
 
     res.status(200).json({ ok: true, event, email });
@@ -186,15 +347,11 @@ app.get('/health', (req, res) => {
 // ── Start server ───────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
-  console.log(`\nMighty Networks Webhook Server running on port ${PORT}`);
+  console.log(`\nWebhook Server running on port ${PORT}`);
   console.log(`\nEndpoints:`);
-  console.log(`  POST http://localhost:${PORT}/webhooks/mighty  ← Mighty sends events here`);
-  console.log(`  GET  http://localhost:${PORT}/health           ← Health check`);
-  console.log(`\nListening for events:`);
-  console.log(`  member.created  → Create/update HubSpot contact`);
-  console.log(`  member.updated  → Update HubSpot contact`);
-  console.log(`  member.deleted  → Set status to "deleted" in HubSpot`);
-  console.log(`\nTo expose publicly for Mighty to reach, run:`);
-  console.log(`  ngrok http ${PORT}`);
-  console.log(`  Then set the ngrok URL in Mighty Networks dashboard as your webhook URL\n`);
+  console.log(`  POST /webhooks/mighty  ← Mighty Networks events`);
+  console.log(`  POST /webhooks/stripe  ← Stripe events`);
+  console.log(`  GET  /health           ← Health check`);
+  console.log(`\nMighty events: member.created, member.updated, member.deleted`);
+  console.log(`Stripe events: subscription.created/updated/deleted, invoice.payment_succeeded/failed\n`);
 });
