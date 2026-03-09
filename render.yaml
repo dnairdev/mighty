@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mighty-webhook
+    runtime: node
+    buildCommand: npm install
+    startCommand: node src/webhook-server.js
+    envVars:
+      - key: HUBSPOT_ACCESS_TOKEN
+        sync: false
+      - key: MIGHTY_WEBHOOK_SECRET
+        sync: false
+      - key: NODE_ENV
+        value: production

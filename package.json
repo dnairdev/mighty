@@ -1,0 +1,44 @@
+{
+  "name": "mighty-hubspot-integration",
+  "version": "1.0.0",
+  "description": "Integration to sync Mighty Networks members and activities to HubSpot",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "sync": "node src/sync.js",
+    "sync-location": "node src/sync-location-only.js",
+    "sync-subscriptions": "node src/sync-subscriptions.js",
+    "sync-stripe": "node src/sync-stripe.js",
+    "check-data": "node src/check-subscription-data.js",
+    "check-cancellations": "node src/check-cancellation-data.js",
+    "find-deleted": "node src/find-deleted-members.js",
+    "tag-winback": "node src/tag-deleted-for-winback.js",
+    "find-subscriptions": "node src/find-subscription-endpoints.js",
+    "inspect-fields": "node src/inspect-all-member-fields.js",
+    "fetch-plans": "node src/fetch-subscription-plans.js",
+    "conversion-report": "node src/conversion-report.js",
+    "verify-mighty-ids": "node src/verify-mighty-ids.js",
+    "inspect-subscriptions": "node src/inspect-subscription-fields.js",
+    "sync-cancellations": "node src/sync-mighty-cancellations.js",
+    "plan-changes": "node src/show-plan-changes.js",
+    "webhook": "node src/webhook-server.js",
+    "test": "node src/test-connection.js",
+    "test-stripe": "node src/test-stripe.js"
+  },
+  "keywords": [
+    "mighty-networks",
+    "hubspot",
+    "integration"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@hubspot/api-client": "^11.2.0",
+    "axios": "^1.6.7",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.1",
+    "express": "^4.18.2",
+    "stripe": "^20.3.1"
+  }
+}
